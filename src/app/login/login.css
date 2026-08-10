@@ -1,0 +1,91 @@
+/* Matches the Label Lab session gate so sign-in and the lab feel like one app. */
+.amp-login {
+  --ink: #101511;
+  --paper: #f4f2e9;
+  --paper-3: #dcd8ca;
+  --green: #a8f07a;
+  --muted: #6f786f;
+  --line: rgba(16, 21, 17, 0.12);
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100dvh;
+  padding: 24px;
+  background: #182019;
+}
+
+.amp-login-card {
+  display: flex;
+  flex-direction: column;
+  width: min(100%, 420px);
+  padding: 40px;
+  background: var(--paper);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 18px;
+  box-shadow: 0 18px 50px rgba(16, 21, 17, 0.12);
+  color: var(--ink);
+}
+
+.amp-login-mark {
+  color: var(--ink);
+  font-size: 32px;
+  font-weight: 850;
+  letter-spacing: -0.08em;
+}
+
+.amp-login-card h1 {
+  margin: 20px 0 6px;
+  font-size: 24px;
+}
+
+.amp-login-sub {
+  margin: 0 0 24px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.amp-login-card label {
+  margin-bottom: 6px;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.amp-login-card input {
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  color: var(--ink);
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font: inherit;
+  font-size: 15px;
+}
+
+.amp-login-card input:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 1px;
+}
+
+.amp-login-error {
+  margin: 0 0 16px;
+  color: #a8321c;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.amp-login-card button {
+  padding: 11px 18px;
+  color: var(--ink);
+  background: var(--green);
+  border: 0;
+  border-radius: 8px;
+  font: inherit;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.amp-login-card button:disabled {
+  background: var(--paper-3);
+  cursor: progress;
+}
