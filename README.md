@@ -74,9 +74,11 @@ Supabase values present — nothing calls Supabase during prerender.
 ## How the labelling flow works
 
 **1 · Setup.** The annotator uploads a video and records the player reference,
-discipline, sex benchmark, age group, camera angle, and frame rate. The browser
-computes a SHA-256 of the file before upload, so every exported row can be traced
-back to exact source media.
+discipline, sex benchmark, age group, camera angle, and frame rate. If multiple
+people are visible, the annotator also selects the person to analyse by cricket
+role and adds a concrete visual description. The browser computes a SHA-256 of
+the file before upload, so every exported row can be traced back to exact source
+media.
 
 **2 · Route selection.** Discipline + tier + variant select one of nine routes:
 
@@ -93,9 +95,11 @@ Each route's KPI weights sum to 100%.
 scrubber offers a 2-second precision window with 1 ms steps and single-frame
 nudges, because evidence timestamps have to land inside the delivery they describe.
 
-**4 · Labelling.** For each delivery the annotator records shot footwork
-(`front_foot` / `back_foot` / `both` / `unclear`), then works the KPI list. A KPI is
-either scored 0–10 with a confidence and at least one evidence timestamp, or marked
+**4 · Labelling.** For each batting delivery the annotator records a controlled
+shot type and shot footwork (`front_foot` / `back_foot` / `both` / `unclear`), then
+works the KPI list. Shot type and footwork are separate human judgements and are
+never inferred from each other or from the outcome note. A KPI is either scored
+0–10 with a confidence and at least one evidence timestamp, or marked
 `occluded`, `low_quality`, `uncertain`, or `not_applicable` — each of which requires
 a reason. KPIs outside the selected camera view are auto-marked `wrong_angle`.
 
@@ -116,10 +120,10 @@ An annotation document is one JSON object stored against the video project:
 ```ts
 interface AnnotationDocument {
   schemaVersion: "amp-labels-long-v1";
-  deliveries: Delivery[];   // segments with startMs/eventMs/endMs, outcome, shotFootwork
+  deliveries: Delivery[];   // segments, outcome, shotType, shotFootwork
   labels: DeliveryLabel[];  // one per delivery × KPI, keyed `deliveryId::kpiId`
   review: ReviewState;      // annotator/reviewer/adjudicator, tier, bowler type,
-                            // capture session, handedness, and athlete measurements
+                            // capture session, subject focus, and athlete metadata
 }
 ```
 
@@ -134,6 +138,10 @@ as a deterministic tie-breaker.
 semantics. In short: one row per video × delivery × KPI, `record_id` is the compound
 key `video_id::delivery_id::kpi_id`, human ground truth is prefixed `human_`, model
 suggestions are prefixed `model_` and never overwrite the human fields.
+
+Crowded-video focus fields repeat on every row, while shot type appears on batting
+delivery rows only. Missing required focus or shot metadata remains explicit as
+`exclude_incomplete`; no role or shot is guessed for legacy annotations.
 
 For supervised score training use `training_score_eligible=true` with
 `training_row_status=ready_scored_label`; include `ready_null_label` rows when
