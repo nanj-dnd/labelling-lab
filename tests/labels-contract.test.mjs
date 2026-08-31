@@ -417,6 +417,8 @@ test("CSV appends compatible footwork and multi-evidence fields while preserving
             "human_shot_type_other",
             "human_bowling_type_faced",
             "bowling_type_faced_source",
+            "human_handedness",
+            "handedness_source",
         ],
     );
 
@@ -887,7 +889,7 @@ test("shared batting routes do not duplicate delivery rows", () => {
     );
 });
 
-test("clip labels require three same-mode deliveries and same-mode evidence", () => {
+test("clip labels need same-mode evidence but no delivery-count minimum", () => {
     const paceClipKpi = {
         ...unrestricted,
         id: "pace-clip",
@@ -928,8 +930,13 @@ test("clip labels require three same-mode deliveries and same-mode evidence", ()
         25,
         routing,
     );
+    // Two pace deliveries is no longer a blocker -- the delivery-count
+    // minimum was removed -- so the only issue left is the evidence that
+    // falls outside a pace delivery.
     assert.ok(
-        underMinimumIssues.some((issue) => issue.id === "consistency-minimum-pace"),
+        !underMinimumIssues.some((issue) =>
+            issue.id.startsWith("consistency-minimum"),
+        ),
     );
     assert.ok(
         underMinimumIssues.some((issue) => issue.id === "evidence-range-clip-pace-clip"),
@@ -940,7 +947,7 @@ test("clip labels require three same-mode deliveries and same-mode evidence", ()
     assert.equal(paceClipRow.training_score_eligible, "false");
     assert.equal(
         paceClipRow.training_row_status,
-        "exclude_insufficient_mode_deliveries",
+        "exclude_evidence_outside_mode_deliveries",
     );
     assert.equal(labels.scoreDocument(document, paceRubric, "side", routing).activeWeight, 0);
 
@@ -986,7 +993,9 @@ test("clip labels require three same-mode deliveries and same-mode evidence", ()
         25,
         routing,
     );
-    assert.ok(!resolvedIssues.some((issue) => issue.id === "consistency-minimum-pace"));
+    assert.ok(
+        !resolvedIssues.some((issue) => issue.id.startsWith("consistency-minimum")),
+    );
     assert.ok(!resolvedIssues.some((issue) => issue.id === "evidence-range-clip-pace-clip"));
     paceClipRow = csvRecords(
         labels.buildLabelsCsv(project, document, paceRubric, routing),
@@ -1008,4 +1017,349 @@ test("clip labels require three same-mode deliveries and same-mode evidence", ()
         labels.scoreDocument(document, paceRubric, "side", routing).activeWeight,
         0,
     );
+});
+
+test("handedness is chosen per delivery and falls back to the session default", () => {
+    // Per-delivery handedness exists so one clip can carry more than one
+    // player. It routes nothing, so an unset delivery must inherit the session
+    // value rather than block review the way bowling type faced does.
+    assert.equal(labels.normalizeHandedness("right"), "right");
+    assert.equal(labels.normalizeHandedness("left"), "left");
+    assert.equal(labels.normalizeHandedness("switch"), null);
+    assert.equal(labels.normalizeHandedness(undefined), null);
+
+    const explicit = labels.normalizeDeliveryHandedness(
+        { handedness: "left" },
+        "right",
+    );
+    assert.equal(explicit.handedness, "left");
+    assert.equal(explicit.handednessSource, "delivery");
+
+    const inherited = labels.normalizeDeliveryHandedness({}, "right");
+    assert.equal(inherited.handedness, "right");
+    assert.equal(inherited.handednessSource, "session_default");
+
+    // An explicit null is a human clearing the field, not an absent field, so
+    // it must never be silently refilled from the session value.
+    const cleared = labels.normalizeDeliveryHandedness(
+        { handedness: null },
+        "right",
+    );
+    assert.equal(cleared.handedness, null);
+    assert.equal(cleared.handednessSource, undefined);
+
+    const unknownSession = labels.normalizeDeliveryHandedness({}, "");
+    assert.equal(unknownSession.handedness, null);
+    assert.equal(unknownSession.handednessSource, undefined);
+});
+
+test("CSV carries per-delivery handedness and marks mixed clips explicitly", () => {
+    const document = documentForTest();
+    document.review.handedness = "right";
+    document.deliveries = document.deliveries.slice(0, 2).map((delivery) => ({
+        ...delivery,
+        bowlingTypeFaced: "pace",
+        bowlingTypeFacedSource: "delivery",
+    }));
+    document.deliveries[0].handedness = "left";
+    document.deliveries[0].handednessSource = "delivery";
+    document.deliveries[1].handedness = "right";
+    document.deliveries[1].handednessSource = "session_default";
+
+    const records = csvRecords(labels.buildLabelsCsv(project, document, rubric));
+    const front = records.find((record) => record.delivery_id === "d-front");
+    const back = records.find((record) => record.delivery_id === "d-back");
+
+    assert.equal(front.human_handedness, "left");
+    assert.equal(front.handedness_source, "delivery");
+    assert.equal(back.human_handedness, "right");
+    assert.equal(back.handedness_source, "session_default");
+
+    // The session-level column keeps its original meaning and position so
+    // existing consumers are untouched by the new per-delivery fields.
+    assert.equal(front.handedness, "right");
+    assert.equal(back.handedness, "right");
+});
+
+test("clip handedness is unanimous-or-mixed, never a guess", () => {
+    const clipKpi = { ...unrestricted, id: "clip-kpi", scope: "clip" };
+    const clipRubric = { ...rubric, id: "clip-rubric", kpis: [clipKpi] };
+    const document = documentForTest();
+    document.deliveries = document.deliveries.slice(0, 2);
+    document.deliveries[0].handedness = "left";
+    document.deliveries[1].handedness = "left";
+    document.labels = [label("clip", clipKpi.id, 500)];
+
+    let clipRow = csvRecords(
+        labels.buildLabelsCsv(project, document, clipRubric),
+    ).find((record) => record.target_scope === "clip");
+    assert.equal(clipRow.human_handedness, "left");
+    assert.equal(clipRow.handedness_source, "delivery_group");
+
+    document.deliveries[1].handedness = "right";
+    clipRow = csvRecords(
+        labels.buildLabelsCsv(project, document, clipRubric),
+    ).find((record) => record.target_scope === "clip");
+    assert.equal(clipRow.human_handedness, "");
+    assert.equal(clipRow.handedness_source, "mixed");
+
+    document.deliveries[0].handedness = null;
+    document.deliveries[1].handedness = null;
+    clipRow = csvRecords(
+        labels.buildLabelsCsv(project, document, clipRubric),
+    ).find((record) => record.target_scope === "clip");
+    assert.equal(clipRow.human_handedness, "");
+    assert.equal(clipRow.handedness_source, "");
+});
+
+test("a single-delivery clip KPI scores without any delivery-count minimum", () => {
+    const clipKpi = { ...unrestricted, id: "solo-clip", scope: "clip" };
+    const clipRubric = { ...rubric, id: "solo-rubric", kpis: [clipKpi] };
+    const document = documentForTest();
+    document.deliveries = document.deliveries.slice(0, 1);
+    document.labels = [label("clip", clipKpi.id, 500)];
+
+    const issues = labels.validateDocument(document, clipRubric, "side", 5000, 25);
+    assert.ok(!issues.some((issue) => issue.id.startsWith("consistency-minimum")));
+
+    const clipRow = csvRecords(
+        labels.buildLabelsCsv(project, document, clipRubric),
+    ).find((record) => record.target_scope === "clip");
+    assert.equal(clipRow.training_score_eligible, "true");
+    assert.equal(clipRow.training_row_status, "ready_scored_label");
+
+    // The score is produced rather than suppressed, which is the whole point
+    // of removing the minimum.
+    const summary = labels.scoreDocument(document, clipRubric, "side", undefined, 25);
+    assert.equal(summary.score10, 8);
+    assert.equal(summary.activeWeight, 50);
+});
+
+test("no CSV row is ever marked exclude_insufficient_mode_deliveries", () => {
+    const paceClipKpi = {
+        ...unrestricted,
+        id: "pace-clip-min",
+        scope: "clip",
+        variant: "pace",
+    };
+    const spinKpi = { ...unrestricted, id: "spin-min", variant: "spin" };
+    const paceRubric = {
+        ...rubric,
+        id: "pace-min-route",
+        routeKey: "batting.performance.pace",
+        kpis: [paceClipKpi],
+    };
+    const routing = {
+        discipline: "batting",
+        battingRubrics: {
+            pace: paceRubric,
+            spin: {
+                ...rubric,
+                id: "spin-min-route",
+                routeKey: "batting.performance.spin",
+                kpis: [spinKpi],
+            },
+        },
+    };
+    const document = documentForTest();
+    document.deliveries = document.deliveries.slice(0, 1);
+    document.deliveries[0].bowlingTypeFaced = "pace";
+    document.deliveries[0].bowlingTypeFacedSource = "delivery";
+    document.labels = [label("clip", paceClipKpi.id, 500)];
+
+    const records = csvRecords(
+        labels.buildLabelsCsv(project, document, paceRubric, routing),
+    );
+    assert.ok(
+        records.every(
+            (record) =>
+                record.training_row_status !== "exclude_insufficient_mode_deliveries",
+        ),
+    );
+    const clipRow = records.find((record) => record.target_scope === "clip");
+    assert.equal(clipRow.training_score_eligible, "true");
+});
+
+test("labelling mode normalizes to biomechanics and never guesses auto clip", () => {
+    // Every saved annotation predates the mode field, so an absent or unknown
+    // value must land on the original workflow rather than silently switching
+    // an existing project to a different collection contract.
+    assert.equal(labels.normalizeLabellingMode(undefined), "biomechanics");
+    assert.equal(labels.normalizeLabellingMode(null), "biomechanics");
+    assert.equal(labels.normalizeLabellingMode("clipping"), "biomechanics");
+    assert.equal(labels.normalizeLabellingMode("auto_clip"), "auto_clip");
+    assert.equal(labels.normalizeLabellingMode("biomechanics"), "biomechanics");
+    assert.equal(labels.emptyDocument().review.labellingMode, "biomechanics");
+});
+
+test("excluded regions normalize, sort and drop unusable entries", () => {
+    const regions = labels.normalizeExcludedRegions([
+        { id: "b", startMs: 5000, endMs: 6000, reason: "replay", note: "n" },
+        { id: "a", startMs: 1000.4, endMs: 2000.6, reason: "bogus" },
+        { id: "", startMs: 0, endMs: 1 },
+        { startMs: 0, endMs: 1 },
+        null,
+        "nope",
+        { id: "c", startMs: "x", endMs: 10 },
+    ]);
+    assert.deepEqual(
+        regions.map((region) => region.id),
+        ["a", "b"],
+    );
+    assert.equal(regions[0].startMs, 1000);
+    assert.equal(regions[0].endMs, 2001);
+    // An unrecognised reason becomes null so validation can force a real choice,
+    // rather than being carried into training data as a made-up category.
+    assert.equal(regions[0].reason, null);
+    assert.equal(regions[0].note, "");
+    assert.equal(regions[1].reason, "replay");
+});
+
+test("background regions are the gaps left by deliveries and exclusions", () => {
+    const gaps = labels.backgroundRegions(
+        10000,
+        [{ startMs: 1000, endMs: 2000 }, { startMs: 4000, endMs: 5000 }],
+        [{ startMs: 7000, endMs: 8000 }],
+    );
+    assert.deepEqual(gaps, [
+        { startMs: 0, endMs: 1000 },
+        { startMs: 2000, endMs: 4000 },
+        { startMs: 5000, endMs: 7000 },
+        { startMs: 8000, endMs: 10000 },
+    ]);
+
+    // Touching and overlapping spans must not produce zero-length or negative
+    // gaps, which would export as malformed background rows.
+    assert.deepEqual(
+        labels.backgroundRegions(3000, [{ startMs: 0, endMs: 1500 }, { startMs: 1500, endMs: 3000 }], []),
+        [],
+    );
+    assert.deepEqual(
+        labels.backgroundRegions(3000, [{ startMs: 0, endMs: 2000 }, { startMs: 1000, endMs: 3000 }], []),
+        [],
+    );
+    assert.deepEqual(labels.backgroundRegions(0, [], []), []);
+});
+
+function clipDocument() {
+    const document = labels.emptyDocument();
+    document.review = {
+        ...document.review,
+        annotator: "expert-a",
+        captureSession: "session-a",
+        labellingMode: "auto_clip",
+        coverageComplete: true,
+    };
+    document.deliveries = [
+        { id: "d1", index: 1, startMs: 1000, eventMs: 1500, endMs: 2000, outcome: "boundary", note: "clean" },
+        { id: "d2", index: 2, startMs: 4000, eventMs: 4500, endMs: 5000, outcome: "", note: "" },
+    ];
+    document.excludedRegions = [
+        { id: "x1", startMs: 7000, endMs: 8000, reason: "replay", note: "broadcast replay" },
+    ];
+    return document;
+}
+
+const clipProject = { ...project, discipline: "batting", durationMs: 10000 };
+
+test("auto-clip validation checks geometry and the coverage assertion, not the rubric", () => {
+    const document = clipDocument();
+    assert.deepEqual(labels.validateDocument(document, rubric, "side", 10000, 25), []);
+
+    // None of the rubric-era blockers apply in this mode.
+    const noBowlingType = clipDocument();
+    const issues = labels.validateDocument(noBowlingType, rubric, "side", 10000, 25, "batting");
+    assert.ok(!issues.some((issue) => issue.id.startsWith("bowling-type-faced")));
+    assert.ok(!issues.some((issue) => issue.id.startsWith("shot-type")));
+
+    const overlapping = clipDocument();
+    overlapping.deliveries[1].startMs = 1500;
+    assert.ok(
+        labels
+            .validateDocument(overlapping, rubric, "side", 10000, 25)
+            .some((issue) => issue.id.startsWith("clip-overlap")),
+    );
+
+    const straddling = clipDocument();
+    straddling.excludedRegions[0].startMs = 1500;
+    straddling.excludedRegions[0].endMs = 2500;
+    assert.ok(
+        labels
+            .validateDocument(straddling, rubric, "side", 10000, 25)
+            .some((issue) => issue.id.startsWith("excluded-overlap")),
+    );
+
+    const noReason = clipDocument();
+    noReason.excludedRegions[0].reason = null;
+    assert.ok(
+        labels
+            .validateDocument(noReason, rubric, "side", 10000, 25)
+            .some((issue) => issue.id.startsWith("excluded-reason")),
+    );
+
+    const notCovered = clipDocument();
+    notCovered.review.coverageComplete = false;
+    assert.ok(
+        labels
+            .validateDocument(notCovered, rubric, "side", 10000, 25)
+            .some((issue) => issue.id === "coverage-not-asserted"),
+    );
+});
+
+test("clip CSV types every span and derives background only once coverage is asserted", () => {
+    const document = clipDocument();
+    const records = csvRecords(labels.buildClipSegmentsCsv(clipProject, document, 10000));
+
+    assert.equal(records[0].csv_schema_version, "amp-clip-segments-v1");
+    assert.equal(records[0].labelling_mode, "auto_clip");
+    assert.deepEqual(
+        records.map((record) => record.segment_type),
+        ["delivery", "delivery", "excluded", "background", "background", "background", "background"],
+    );
+
+    const firstDelivery = records[0];
+    assert.equal(firstDelivery.start_ms, "1000");
+    assert.equal(firstDelivery.end_ms, "2000");
+    assert.equal(firstDelivery.duration_ms, "1000");
+    assert.equal(firstDelivery.event_ms, "1500");
+    assert.equal(firstDelivery.delivery_index, "1");
+    assert.equal(firstDelivery.delivery_outcome, "boundary");
+    // 25 fps: 1000 ms is frame 25, 1500 ms is frame 37 (nearest).
+    assert.equal(firstDelivery.start_frame_0based, "25");
+    assert.equal(firstDelivery.event_frame_0based, "38");
+
+    const excluded = records.find((record) => record.segment_type === "excluded");
+    assert.equal(excluded.exclusion_reason, "replay");
+    assert.equal(excluded.segment_note, "broadcast replay");
+    assert.equal(excluded.delivery_index, "");
+
+    assert.deepEqual(
+        records
+            .filter((record) => record.segment_type === "background")
+            .map((record) => [record.start_ms, record.end_ms]),
+        [["0", "1000"], ["2000", "4000"], ["5000", "7000"], ["8000", "10000"]],
+    );
+    // The tail after the excluded region is background too.
+    assert.equal(records.every((record) => record.coverage_complete === "true"), true);
+});
+
+test("without the coverage assertion the clip CSV ships positives but no negatives", () => {
+    const document = clipDocument();
+    document.review.coverageComplete = false;
+    const records = csvRecords(labels.buildClipSegmentsCsv(clipProject, document, 10000));
+
+    // An unmarked delivery would otherwise be exported as confirmed
+    // non-delivery, so the negatives are withheld rather than guessed.
+    assert.ok(!records.some((record) => record.segment_type === "background"));
+    assert.equal(records.filter((record) => record.segment_type === "delivery").length, 2);
+    assert.equal(records.filter((record) => record.segment_type === "excluded").length, 1);
+    assert.equal(records.every((record) => record.coverage_complete === "false"), true);
+});
+
+test("biomechanics projects are untouched by the mode split", () => {
+    const document = documentForTest();
+    assert.equal(labels.normalizeLabellingMode(document.review.labellingMode), "biomechanics");
+    const records = csvRecords(labels.buildLabelsCsv(project, document, rubric));
+    assert.ok(records.length > 0);
+    assert.equal(records[0].csv_schema_version, "amp-training-labels-long-v2");
 });

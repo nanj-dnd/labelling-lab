@@ -20,12 +20,23 @@ import {
   isFootworkRestrictedKpi,
   isSubjectFocusComplete,
   normalizeDeliveryShotMetadata,
+  normalizeExcludedRegion,
+  normalizeExcludedRegions,
+  normalizeExclusionReason,
+  normalizeLabellingMode,
   normalizeShotType,
   normalizeSubjectFocusMetadata,
   normalizeSubjectFocusRole,
+  backgroundRegions,
+  rangesOverlap,
+  EXCLUSION_REASONS,
+  LABELLING_MODES,
   SHOT_TYPE_VALUES,
   SUBJECT_FOCUS_ROLE_VALUES,
   type DeliveryShotMetadata,
+  type ExcludedRegion,
+  type ExclusionReason,
+  type LabellingMode,
   type FootworkApplicabilityState,
   type ShotType,
   type ShotFootwork,
@@ -43,14 +54,25 @@ export {
   isFootworkRestrictedKpi,
   isSubjectFocusComplete,
   normalizeDeliveryShotMetadata,
+  normalizeExcludedRegion,
+  normalizeExcludedRegions,
+  normalizeExclusionReason,
+  normalizeLabellingMode,
   normalizeShotType,
   normalizeSubjectFocusMetadata,
   normalizeSubjectFocusRole,
+  backgroundRegions,
+  rangesOverlap,
+  EXCLUSION_REASONS,
+  LABELLING_MODES,
   SHOT_TYPE_VALUES,
   SUBJECT_FOCUS_ROLE_VALUES,
 };
 export type {
   DeliveryShotMetadata,
+  ExcludedRegion,
+  ExclusionReason,
+  LabellingMode,
   FootworkApplicabilityState,
   ShotFootwork,
   ShotType,
@@ -62,6 +84,15 @@ export type Visibility = "visible" | "occluded" | "low_quality" | "uncertain" | 
 export const BOWLING_TYPE_FACED_VALUES = ["pace", "spin"] as const;
 export type BowlingTypeFaced = BattingMode;
 export type BowlingTypeFacedSource = "delivery" | "legacy_review_fallback";
+export const HANDEDNESS_VALUES = ["right", "left"] as const;
+export type Handedness = (typeof HANDEDNESS_VALUES)[number];
+/**
+ * `session_default` rather than `legacy_review_fallback`: per-delivery
+ * handedness is new, so no saved annotation carries the field yet and every
+ * existing delivery inherits the session value. The name describes what the
+ * inheritance actually is instead of implying a legacy migration path.
+ */
+export type HandednessSource = "delivery" | "session_default";
 
 export interface DeliveryLabel {
   id: string;
@@ -92,6 +123,8 @@ export interface Delivery {
   bowlingTypeFacedSource?: BowlingTypeFacedSource;
   shotType?: ShotType | null;
   shotTypeOther?: string;
+  handedness?: Handedness | null;
+  handednessSource?: HandednessSource;
 }
 
 export interface LabelRubricRouting {
@@ -114,6 +147,13 @@ export interface ReviewState {
   multiplePeopleVisible: boolean;
   subjectFocusRole: SubjectFocusRole | null;
   subjectFocusDescription: string;
+  labellingMode: LabellingMode;
+  /**
+   * Auto-clip only. The annotator asserting that every delivery in the video
+   * is marked. Nothing derives background negatives without it, because an
+   * unmarked delivery would otherwise be exported as confirmed non-delivery.
+   */
+  coverageComplete: boolean;
 }
 
 export interface AnnotationDocument {
@@ -121,6 +161,8 @@ export interface AnnotationDocument {
   deliveries: Delivery[];
   labels: DeliveryLabel[];
   review: ReviewState;
+  /** Auto-clip only; empty for biomechanics projects. */
+  excludedRegions?: ExcludedRegion[];
 }
 
 export interface QualityIssue {
@@ -155,6 +197,8 @@ export const EMPTY_REVIEW: ReviewState = {
   multiplePeopleVisible: false,
   subjectFocusRole: null,
   subjectFocusDescription: "",
+  labellingMode: "biomechanics",
+  coverageComplete: false,
 };
 
 export const MIN_RATING_WEIGHT_PCT = 50;
@@ -165,6 +209,7 @@ export function emptyDocument(): AnnotationDocument {
     deliveries: [],
     labels: [],
     review: { ...EMPTY_REVIEW },
+    excludedRegions: [],
   };
 }
 
@@ -208,6 +253,58 @@ export function normalizeDeliveryBowlingTypeFaced(
           ? "delivery" as const
           : "legacy_review_fallback" as const
       : undefined,
+  };
+}
+
+export function normalizeHandedness(value: unknown): Handedness | null {
+  return HANDEDNESS_VALUES.includes(value as Handedness)
+    ? (value as Handedness)
+    : null;
+}
+
+/**
+ * Handedness is recorded per delivery so one clip can carry more than one
+ * batter or bowler. It is deliberately not a review blocker: unlike bowling
+ * type faced, handedness routes nothing, so an unset delivery inherits the
+ * session-level `review.handedness` rather than stopping the annotator. Rows
+ * that inherit are marked `session_default` so a consumer can tell a human
+ * per-delivery judgement apart from a carried-over session value.
+ */
+export function normalizeDeliveryHandedness(
+  delivery: Pick<Delivery, "handedness" | "handednessSource">,
+  legacyReviewValue?: unknown,
+) {
+  const hasExplicitValue = Object.prototype.hasOwnProperty.call(
+    delivery,
+    "handedness",
+  );
+  const handedness = hasExplicitValue
+    ? normalizeHandedness(delivery.handedness)
+    : normalizeHandedness(legacyReviewValue);
+  return {
+    handedness,
+    handednessSource: handedness
+      ? delivery.handednessSource === "session_default"
+        ? "session_default" as const
+        : hasExplicitValue
+          ? "delivery" as const
+          : "session_default" as const
+      : undefined,
+  };
+}
+
+function clipHandednessFor(deliveries: Delivery[]) {
+  const distinct = new Set(
+    deliveries
+      .map((delivery) => normalizeHandedness(delivery.handedness))
+      .filter((value): value is Handedness => value !== null),
+  );
+  if (distinct.size === 1) {
+    return { handedness: [...distinct][0], source: "delivery_group" as const };
+  }
+  return {
+    handedness: null,
+    source: distinct.size > 1 ? ("mixed" as const) : ("" as const),
   };
 }
 
@@ -379,18 +476,10 @@ export function scoreDocument(
     const resolvedDeliveries = routing?.discipline === "batting"
       ? document.deliveries.filter((delivery) => delivery.bowlingTypeFaced)
       : document.deliveries;
-    const clipKpiIds = new Set(
-      contexts[0].rubric.kpis
-        .filter((kpi) => kpi.scope === "clip")
-        .map((kpi) => kpi.id),
-    );
     const resolvedDocument = {
       ...document,
       deliveries: resolvedDeliveries,
-      labels:
-        routing?.discipline === "batting" && resolvedDeliveries.length < 3
-          ? document.labels.filter((label) => !clipKpiIds.has(label.kpiId))
-          : document.labels,
+      labels: document.labels,
     };
     return scoreSingleRubric(
       resolvedDocument,
@@ -409,15 +498,7 @@ export function scoreDocument(
       {
         ...document,
         deliveries: context.deliveries,
-        labels:
-          context.deliveries.length < 3
-            ? document.labels.filter(
-                (label) =>
-                  !context.rubric.kpis.some(
-                    (kpi) => kpi.scope === "clip" && kpi.id === label.kpiId,
-                  ),
-              )
-            : document.labels,
+        labels: document.labels,
       },
       context.rubric,
       angle,
@@ -469,7 +550,6 @@ function validateSingleRubric(
   fps?: number,
   discipline?: Discipline,
   clipEvidenceDeliveries?: Delivery[],
-  bowlingTypeFaced?: BowlingTypeFaced | null,
 ): QualityIssue[] {
   const issues: QualityIssue[] = [];
   if (!document.review.annotator.trim()) {
@@ -508,17 +588,6 @@ function validateSingleRubric(
       id: "delivery-required",
       severity: "blocker",
       message: "Mark at least one complete delivery.",
-    });
-  }
-  if (document.deliveries.length < 3 && rubric.kpis.some((kpi) => kpi.scope === "clip")) {
-    issues.push({
-      id: bowlingTypeFaced
-        ? `consistency-minimum-${bowlingTypeFaced}`
-        : "consistency-minimum",
-      severity: "blocker",
-      message: bowlingTypeFaced
-        ? `Add at least three ${bowlingTypeFaced} deliveries before scoring ${bowlingTypeFaced} consistency KPIs.`
-        : "Add at least three deliveries before scoring consistency KPIs.",
     });
   }
 
@@ -710,6 +779,119 @@ function validateSingleRubric(
   return issues;
 }
 
+/**
+ * Auto-clip validation. A clipping dataset is judged on its segment geometry
+ * and on whether its negatives can be trusted, so this checks boundaries,
+ * overlaps and the coverage assertion -- and deliberately shares none of the
+ * rubric, footwork or KPI checks, which mean nothing in this mode.
+ */
+function validateClipDocument(
+  document: AnnotationDocument,
+  durationMs: number,
+): QualityIssue[] {
+  const issues: QualityIssue[] = [];
+  if (!document.review.annotator.trim()) {
+    issues.push({
+      id: "annotator-required",
+      severity: "blocker",
+      message: "Add the annotator name before review.",
+    });
+  }
+  if (!document.review.captureSession.trim()) {
+    issues.push({
+      id: "session-required",
+      severity: "blocker",
+      message: "Add a capture-session ID so dataset splits stay player/session safe.",
+    });
+  }
+  if (document.deliveries.length === 0) {
+    issues.push({
+      id: "delivery-required",
+      severity: "blocker",
+      message: "Mark at least one delivery.",
+    });
+  }
+
+  const deliveries = [...document.deliveries].sort(
+    (left, right) => left.startMs - right.startMs,
+  );
+  for (const delivery of deliveries) {
+    if (
+      delivery.startMs < 0 ||
+      delivery.startMs >= delivery.endMs ||
+      delivery.endMs > durationMs + 50
+    ) {
+      issues.push({
+        id: `clip-bounds-${delivery.id}`,
+        severity: "blocker",
+        message: `Delivery ${delivery.index} has start and end times outside the video.`,
+        deliveryId: delivery.id,
+      });
+    }
+  }
+
+  // Overlapping deliveries are a blocker here, not a warning: a detection
+  // model needs one unambiguous label per frame, and overlapping spans make
+  // the target for the shared frames undefined.
+  for (let index = 1; index < deliveries.length; index += 1) {
+    const previous = deliveries[index - 1];
+    const current = deliveries[index];
+    if (rangesOverlap(previous.startMs, previous.endMs, current.startMs, current.endMs)) {
+      issues.push({
+        id: `clip-overlap-${previous.id}-${current.id}`,
+        severity: "blocker",
+        message: `Deliveries ${previous.index} and ${current.index} overlap; a clip boundary cannot cover both.`,
+        deliveryId: current.id,
+      });
+    }
+  }
+
+  const excluded = normalizeExcludedRegions(document.excludedRegions);
+  for (const region of excluded) {
+    if (
+      region.startMs < 0 ||
+      region.startMs >= region.endMs ||
+      region.endMs > durationMs + 50
+    ) {
+      issues.push({
+        id: `excluded-bounds-${region.id}`,
+        severity: "blocker",
+        message: "An excluded region has start and end times outside the video.",
+      });
+    }
+    if (!region.reason) {
+      issues.push({
+        id: `excluded-reason-${region.id}`,
+        severity: "blocker",
+        message: "Choose why each region is excluded, so the reason is explicit in training data.",
+      });
+    }
+    for (const delivery of deliveries) {
+      if (rangesOverlap(region.startMs, region.endMs, delivery.startMs, delivery.endMs)) {
+        issues.push({
+          id: `excluded-overlap-${region.id}-${delivery.id}`,
+          severity: "blocker",
+          message: `An excluded region overlaps delivery ${delivery.index}; a span cannot be both.`,
+          deliveryId: delivery.id,
+        });
+      }
+    }
+  }
+
+  // Without the assertion the export still ships the marked deliveries, but it
+  // cannot ship background rows, which is most of the training signal.
+  if (!document.review.coverageComplete) {
+    issues.push({
+      id: "coverage-not-asserted",
+      severity: "blocker",
+      message:
+        "Confirm every delivery in this video is marked. Until then the export carries no background rows.",
+    });
+  }
+
+  return [...new Map(issues.map((issue) => [issue.id, issue])).values()];
+}
+
 export function validateDocument(
   document: AnnotationDocument,
   rubric: Rubric,
@@ -718,6 +900,9 @@ export function validateDocument(
   fps?: number,
   disciplineOrRouting?: Discipline | LabelRubricRouting,
 ): QualityIssue[] {
+  if (normalizeLabellingMode(document.review.labellingMode) === "auto_clip") {
+    return validateClipDocument(document, durationMs);
+  }
   const routing = typeof disciplineOrRouting === "object" ? disciplineOrRouting : undefined;
   const discipline = typeof disciplineOrRouting === "string"
     ? disciplineOrRouting
@@ -761,7 +946,6 @@ export function validateDocument(
         fps,
         discipline,
         context.deliveries,
-        context.bowlingTypeFaced,
       ),
     );
   return [
@@ -877,6 +1061,8 @@ export const LABELS_CSV_COLUMNS = [
   "human_shot_type_other",
   "human_bowling_type_faced",
   "bowling_type_faced_source",
+  "human_handedness",
+  "handedness_source",
 ] as const;
 
 type LabelsCsvColumn = (typeof LABELS_CSV_COLUMNS)[number];
@@ -1007,6 +1193,8 @@ export function buildLabelsCsv(
               bowlingTypeFacedSource: "delivery" as const,
               shotType: null,
               shotTypeOther: "",
+              handedness: null,
+              handednessSource: undefined as HandednessSource | undefined,
             }]
           : [...context.deliveries].sort(
               (left, right) =>
@@ -1075,6 +1263,11 @@ export function buildLabelsCsv(
       const resolvedContextDeliveries = context.deliveries.filter(
         (delivery) => delivery.bowlingTypeFaced,
       );
+      // A clip row spans many deliveries, so it can only carry a handedness
+      // when they all agree. Disagreement is reported as an explicit `mixed`
+      // source rather than a blank, so a consumer can tell "several batters in
+      // this clip" apart from "nobody recorded it".
+      const clipHandedness = clipHandednessFor(context.deliveries);
       const evidenceWithinTarget =
         kpi.scope === "delivery"
           ? typeof target.startMs === "number" &&
@@ -1091,14 +1284,9 @@ export function buildLabelsCsv(
                 ),
               )
             : true;
-      const hasClipDeliveryMinimum =
-        kpi.scope !== "clip" ||
-        routing?.discipline !== "batting" ||
-        resolvedContextDeliveries.length >= 3;
       const trainingScoreEligible = Boolean(
         rowContextComplete &&
         humanLabelApplicable &&
-        hasClipDeliveryMinimum &&
         humanScore !== null &&
         humanScore >= 0 &&
         humanScore <= 10 &&
@@ -1131,10 +1319,8 @@ export function buildLabelsCsv(
                   : "human_null";
       const trainingRowStatus = bowlingTypeMissing
         ? "exclude_bowling_type_faced_missing"
-        : kpi.scope === "clip" && !hasClipDeliveryMinimum
-          ? "exclude_insufficient_mode_deliveries"
-          : kpi.scope === "clip" && humanEvidenceTimestamps.length > 0 && !evidenceWithinTarget
-            ? "exclude_evidence_outside_mode_deliveries"
+        : kpi.scope === "clip" && humanEvidenceTimestamps.length > 0 && !evidenceWithinTarget
+          ? "exclude_evidence_outside_mode_deliveries"
         : !rowContextComplete
         ? "exclude_incomplete"
         : !supported
@@ -1288,6 +1474,14 @@ export function buildLabelsCsv(
             : context.bowlingTypeFaced
               ? "delivery_mode_group"
               : "",
+        human_handedness:
+          kpi.scope === "delivery"
+            ? target.handedness ?? ""
+            : clipHandedness.handedness ?? "",
+        handedness_source:
+          kpi.scope === "delivery"
+            ? target.handednessSource ?? (target.handedness ? "delivery" : "")
+            : clipHandedness.source,
       });
     }
   }
@@ -1298,6 +1492,156 @@ export function buildLabelsCsv(
     ...rows.map((row) => LABELS_CSV_COLUMNS.map((column) => csvCell(row[column])).join(",")),
   ]
     .join("\r\n");
+}
+
+export const CLIP_SEGMENTS_CSV_SCHEMA_VERSION = "amp-clip-segments-v1";
+
+/**
+ * Auto-clip export. One row per labelled span of video, typed by `segment_type`:
+ *
+ * - `delivery`   -- a human-marked delivery, the positive examples;
+ * - `excluded`   -- a span that is neither delivery nor usable background
+ *                   (replay, slow motion, warm-up, cutaway); and
+ * - `background` -- the derived remainder, the confirmed negatives.
+ *
+ * Background rows exist only when the annotator asserted complete coverage.
+ * Without that assertion an unmarked delivery would be exported as confirmed
+ * non-delivery, which is worse than having no negatives at all, so the export
+ * ships positives only and says so in `coverage_complete`.
+ */
+export const CLIP_SEGMENTS_CSV_COLUMNS = [
+  "csv_schema_version",
+  "annotation_schema_version",
+  "labelling_mode",
+  "record_id",
+  "video_id",
+  "video_sha256",
+  "filename",
+  "video_duration_ms",
+  "video_fps",
+  "capture_session_id",
+  "dataset_group_key",
+  "player_ref",
+  "discipline",
+  "camera_angle",
+  "coverage_complete",
+  "segment_type",
+  "segment_index",
+  "delivery_index",
+  "start_ms",
+  "end_ms",
+  "duration_ms",
+  "start_frame_0based",
+  "end_frame_0based",
+  "event_ms",
+  "event_frame_0based",
+  "exclusion_reason",
+  "segment_note",
+  "delivery_outcome",
+  "annotator",
+  "reviewer",
+  "reviewed_at",
+  "project_status",
+  "project_created_at",
+] as const;
+
+type ClipSegmentsCsvColumn = (typeof CLIP_SEGMENTS_CSV_COLUMNS)[number];
+type ClipSegmentsCsvRow = Record<ClipSegmentsCsvColumn, LabelsCsvValue>;
+
+export function buildClipSegmentsCsv(
+  project: CsvProject,
+  document: AnnotationDocument,
+  durationMs: number,
+) {
+  const datasetGroupKey = [project.playerRef, document.review.captureSession]
+    .filter(Boolean)
+    .join("::");
+  const coverageComplete = document.review.coverageComplete === true;
+  const deliveries = [...document.deliveries].sort(
+    (left, right) => left.startMs - right.startMs || left.id.localeCompare(right.id),
+  );
+  const excluded = normalizeExcludedRegions(document.excludedRegions);
+  const background = coverageComplete
+    ? backgroundRegions(durationMs, deliveries, excluded)
+    : [];
+
+  const base = {
+    csv_schema_version: CLIP_SEGMENTS_CSV_SCHEMA_VERSION,
+    annotation_schema_version: document.schemaVersion,
+    labelling_mode: "auto_clip",
+    video_id: project.id,
+    video_sha256: project.sha256,
+    filename: project.filename,
+    video_duration_ms: Math.round(durationMs),
+    video_fps: project.fps,
+    capture_session_id: document.review.captureSession,
+    dataset_group_key: datasetGroupKey,
+    player_ref: project.playerRef,
+    discipline: project.discipline,
+    camera_angle: project.cameraAngle,
+    coverage_complete: coverageComplete,
+    annotator: document.review.annotator,
+    reviewer: document.review.reviewer,
+    reviewed_at: document.review.reviewedAt,
+    project_status: project.status,
+    project_created_at: project.createdAt,
+  };
+
+  const rows: ClipSegmentsCsvRow[] = [];
+  let segmentIndex = 0;
+
+  const push = (
+    segmentType: "delivery" | "excluded" | "background",
+    startMs: number,
+    endMs: number,
+    extra: Partial<ClipSegmentsCsvRow>,
+  ) => {
+    segmentIndex += 1;
+    rows.push({
+      ...base,
+      record_id: `${project.id}::${segmentType}::${segmentIndex}`,
+      segment_type: segmentType,
+      segment_index: segmentIndex,
+      delivery_index: "",
+      start_ms: Math.round(startMs),
+      end_ms: Math.round(endMs),
+      duration_ms: Math.round(endMs - startMs),
+      start_frame_0based: frameIndex(Math.round(startMs), project.fps),
+      end_frame_0based: frameIndex(Math.round(endMs), project.fps),
+      event_ms: "",
+      event_frame_0based: "",
+      exclusion_reason: "",
+      segment_note: "",
+      delivery_outcome: "",
+      ...extra,
+    } as ClipSegmentsCsvRow);
+  };
+
+  for (const delivery of deliveries) {
+    push("delivery", delivery.startMs, delivery.endMs, {
+      delivery_index: delivery.index,
+      event_ms: Math.round(delivery.eventMs),
+      event_frame_0based: frameIndex(Math.round(delivery.eventMs), project.fps),
+      segment_note: delivery.note,
+      delivery_outcome: delivery.outcome,
+    });
+  }
+  for (const region of excluded) {
+    push("excluded", region.startMs, region.endMs, {
+      exclusion_reason: region.reason ?? "",
+      segment_note: region.note,
+    });
+  }
+  for (const gap of background) {
+    push("background", gap.startMs, gap.endMs, {});
+  }
+
+  return [
+    CLIP_SEGMENTS_CSV_COLUMNS.map((column) => csvCell(column)).join(","),
+    ...rows.map((row) =>
+      CLIP_SEGMENTS_CSV_COLUMNS.map((column) => csvCell(row[column])).join(","),
+    ),
+  ].join("\r\n");
 }
 
 export function makeLabel(

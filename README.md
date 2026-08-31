@@ -103,6 +103,13 @@ never inferred from each other or from the outcome note. A KPI is either scored
 `occluded`, `low_quality`, `uncertain`, or `not_applicable` — each of which requires
 a reason. KPIs outside the selected camera view are auto-marked `wrong_angle`.
 
+Handedness is recorded per delivery, so one clip can cover more than one player.
+Unlike bowling type faced it routes nothing, so it never blocks review: a delivery
+with no handedness of its own inherits the session default and exports
+`handedness_source=session_default`, while a per-delivery choice exports
+`delivery`. Clip-scoped rows carry a handedness only when every delivery agrees,
+and report `mixed` when they don't.
+
 Footwork drives applicability: a `Front-Foot Only` KPI applies to `front_foot` and
 `both` deliveries and is excluded on `back_foot`. Excluded rows still appear in the
 export, with their scores suppressed, so the exclusion itself is part of the record.

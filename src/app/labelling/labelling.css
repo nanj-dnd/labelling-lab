@@ -1679,6 +1679,87 @@
   font-weight: 750;
 }
 
+.amp-labelling .handedness-field {
+  min-width: 0;
+  padding: 12px 0 0;
+  margin: 14px 0 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+
+.amp-labelling .handedness-field legend {
+  padding: 0;
+  color: var(--ink);
+  font-size: 9px;
+  font-weight: 750;
+}
+
+.amp-labelling .handedness-field legend em {
+  margin-left: 5px;
+  color: var(--green-deep);
+  font-size: 7px;
+  font-style: normal;
+  font-weight: 650;
+  text-transform: uppercase;
+}
+
+.amp-labelling .handedness-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.amp-labelling .handedness-options button {
+  min-height: 32px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font-size: 8px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.amp-labelling .handedness-options button.active {
+  color: var(--ink);
+  background: var(--green);
+  border-color: var(--green-deep);
+}
+
+.amp-labelling .handedness-field > small {
+  display: block;
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 7px;
+  line-height: 1.45;
+}
+
+.amp-labelling .handedness-field--compact {
+  padding: 10px 11px;
+  margin: 0 0 12px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.amp-labelling .handedness-field--compact .handedness-options {
+  margin-top: 6px;
+}
+
+.amp-labelling .handedness-recorded {
+  color: var(--green-deep) !important;
+}
+
+/*
+ * Inherited handedness is muted rather than red: unlike bowling type faced, an
+ * unset delivery is not an error -- it falls back to the session value, so it
+ * must not read as a blocker in the delivery list.
+ */
+.amp-labelling .handedness-inherited {
+  color: var(--muted) !important;
+}
+
 .amp-labelling .footwork-field legend {
   padding: 0;
   color: var(--ink);
@@ -3248,4 +3329,199 @@
     scroll-behavior: auto !important;
     transition: none !important;
   }
+}
+
+/* Labelling-mode picker on the upload card. */
+.amp-labelling .mode-picker {
+  padding: 0;
+  margin: 18px 0 0;
+  border: 0;
+}
+
+.amp-labelling .mode-picker legend {
+  padding: 0;
+  color: var(--ink);
+  font-size: 9px;
+  font-weight: 750;
+}
+
+.amp-labelling .mode-picker legend em {
+  margin-left: 5px;
+  color: var(--green-deep);
+  font-size: 7px;
+  font-style: normal;
+  font-weight: 650;
+  text-transform: uppercase;
+}
+
+.amp-labelling .mode-picker-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.amp-labelling .mode-picker-options button {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 11px 12px;
+  text-align: left;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.amp-labelling .mode-picker-options button.active {
+  background: var(--green);
+  border-color: var(--green-deep);
+}
+
+.amp-labelling .mode-picker-options button strong {
+  color: var(--ink);
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.amp-labelling .mode-picker-options button small {
+  color: var(--muted);
+  font-size: 7px;
+  line-height: 1.45;
+}
+
+.amp-labelling .mode-picker-options button.active small {
+  color: var(--green-dark);
+}
+
+/* Auto-clip only: excluded regions and the coverage assertion. */
+.amp-labelling .clip-extras {
+  padding: 14px 0 0;
+  margin-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.amp-labelling .clip-extras-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.amp-labelling .clip-extras-heading h3 {
+  margin: 0;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.amp-labelling .clip-extras-heading button {
+  padding: 5px 9px;
+  color: var(--ink);
+  background: var(--paper-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 8px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.amp-labelling .clip-extras-copy,
+.amp-labelling .clip-extras-empty {
+  margin: 7px 0 0;
+  color: var(--muted);
+  font-size: 7px;
+  line-height: 1.5;
+}
+
+.amp-labelling .excluded-region-list {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 0;
+  margin: 11px 0 0;
+  list-style: none;
+}
+
+.amp-labelling .excluded-region-list li {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  background: var(--paper-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.amp-labelling .excluded-region-times {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.amp-labelling .excluded-region-times > button {
+  color: var(--ink);
+  background: transparent;
+  border: 0;
+  font-size: 9px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.amp-labelling .excluded-region-times span {
+  display: flex;
+  gap: 4px;
+}
+
+.amp-labelling .excluded-region-times span button {
+  padding: 4px 7px;
+  color: var(--muted);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font-size: 7px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.amp-labelling .excluded-region-list select,
+.amp-labelling .excluded-region-list input {
+  width: 100%;
+  padding: 6px 8px;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 8px;
+}
+
+.amp-labelling .excluded-region-remove {
+  align-self: flex-start;
+  color: #9b3d2d;
+  background: transparent;
+  border: 0;
+  font-size: 7px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.amp-labelling .coverage-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px;
+  margin-top: 12px;
+  background: var(--paper-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 7px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.amp-labelling .coverage-row input {
+  margin-top: 1px;
+  flex-shrink: 0;
 }
