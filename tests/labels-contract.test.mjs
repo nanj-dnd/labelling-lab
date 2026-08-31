@@ -1179,3 +1179,187 @@ test("no CSV row is ever marked exclude_insufficient_mode_deliveries", () => {
     const clipRow = records.find((record) => record.target_scope === "clip");
     assert.equal(clipRow.training_score_eligible, "true");
 });
+
+test("labelling mode normalizes to biomechanics and never guesses auto clip", () => {
+    // Every saved annotation predates the mode field, so an absent or unknown
+    // value must land on the original workflow rather than silently switching
+    // an existing project to a different collection contract.
+    assert.equal(labels.normalizeLabellingMode(undefined), "biomechanics");
+    assert.equal(labels.normalizeLabellingMode(null), "biomechanics");
+    assert.equal(labels.normalizeLabellingMode("clipping"), "biomechanics");
+    assert.equal(labels.normalizeLabellingMode("auto_clip"), "auto_clip");
+    assert.equal(labels.normalizeLabellingMode("biomechanics"), "biomechanics");
+    assert.equal(labels.emptyDocument().review.labellingMode, "biomechanics");
+});
+
+test("excluded regions normalize, sort and drop unusable entries", () => {
+    const regions = labels.normalizeExcludedRegions([
+        { id: "b", startMs: 5000, endMs: 6000, reason: "replay", note: "n" },
+        { id: "a", startMs: 1000.4, endMs: 2000.6, reason: "bogus" },
+        { id: "", startMs: 0, endMs: 1 },
+        { startMs: 0, endMs: 1 },
+        null,
+        "nope",
+        { id: "c", startMs: "x", endMs: 10 },
+    ]);
+    assert.deepEqual(
+        regions.map((region) => region.id),
+        ["a", "b"],
+    );
+    assert.equal(regions[0].startMs, 1000);
+    assert.equal(regions[0].endMs, 2001);
+    // An unrecognised reason becomes null so validation can force a real choice,
+    // rather than being carried into training data as a made-up category.
+    assert.equal(regions[0].reason, null);
+    assert.equal(regions[0].note, "");
+    assert.equal(regions[1].reason, "replay");
+});
+
+test("background regions are the gaps left by deliveries and exclusions", () => {
+    const gaps = labels.backgroundRegions(
+        10000,
+        [{ startMs: 1000, endMs: 2000 }, { startMs: 4000, endMs: 5000 }],
+        [{ startMs: 7000, endMs: 8000 }],
+    );
+    assert.deepEqual(gaps, [
+        { startMs: 0, endMs: 1000 },
+        { startMs: 2000, endMs: 4000 },
+        { startMs: 5000, endMs: 7000 },
+        { startMs: 8000, endMs: 10000 },
+    ]);
+
+    // Touching and overlapping spans must not produce zero-length or negative
+    // gaps, which would export as malformed background rows.
+    assert.deepEqual(
+        labels.backgroundRegions(3000, [{ startMs: 0, endMs: 1500 }, { startMs: 1500, endMs: 3000 }], []),
+        [],
+    );
+    assert.deepEqual(
+        labels.backgroundRegions(3000, [{ startMs: 0, endMs: 2000 }, { startMs: 1000, endMs: 3000 }], []),
+        [],
+    );
+    assert.deepEqual(labels.backgroundRegions(0, [], []), []);
+});
+
+function clipDocument() {
+    const document = labels.emptyDocument();
+    document.review = {
+        ...document.review,
+        annotator: "expert-a",
+        captureSession: "session-a",
+        labellingMode: "auto_clip",
+        coverageComplete: true,
+    };
+    document.deliveries = [
+        { id: "d1", index: 1, startMs: 1000, eventMs: 1500, endMs: 2000, outcome: "boundary", note: "clean" },
+        { id: "d2", index: 2, startMs: 4000, eventMs: 4500, endMs: 5000, outcome: "", note: "" },
+    ];
+    document.excludedRegions = [
+        { id: "x1", startMs: 7000, endMs: 8000, reason: "replay", note: "broadcast replay" },
+    ];
+    return document;
+}
+
+const clipProject = { ...project, discipline: "batting", durationMs: 10000 };
+
+test("auto-clip validation checks geometry and the coverage assertion, not the rubric", () => {
+    const document = clipDocument();
+    assert.deepEqual(labels.validateDocument(document, rubric, "side", 10000, 25), []);
+
+    // None of the rubric-era blockers apply in this mode.
+    const noBowlingType = clipDocument();
+    const issues = labels.validateDocument(noBowlingType, rubric, "side", 10000, 25, "batting");
+    assert.ok(!issues.some((issue) => issue.id.startsWith("bowling-type-faced")));
+    assert.ok(!issues.some((issue) => issue.id.startsWith("shot-type")));
+
+    const overlapping = clipDocument();
+    overlapping.deliveries[1].startMs = 1500;
+    assert.ok(
+        labels
+            .validateDocument(overlapping, rubric, "side", 10000, 25)
+            .some((issue) => issue.id.startsWith("clip-overlap")),
+    );
+
+    const straddling = clipDocument();
+    straddling.excludedRegions[0].startMs = 1500;
+    straddling.excludedRegions[0].endMs = 2500;
+    assert.ok(
+        labels
+            .validateDocument(straddling, rubric, "side", 10000, 25)
+            .some((issue) => issue.id.startsWith("excluded-overlap")),
+    );
+
+    const noReason = clipDocument();
+    noReason.excludedRegions[0].reason = null;
+    assert.ok(
+        labels
+            .validateDocument(noReason, rubric, "side", 10000, 25)
+            .some((issue) => issue.id.startsWith("excluded-reason")),
+    );
+
+    const notCovered = clipDocument();
+    notCovered.review.coverageComplete = false;
+    assert.ok(
+        labels
+            .validateDocument(notCovered, rubric, "side", 10000, 25)
+            .some((issue) => issue.id === "coverage-not-asserted"),
+    );
+});
+
+test("clip CSV types every span and derives background only once coverage is asserted", () => {
+    const document = clipDocument();
+    const records = csvRecords(labels.buildClipSegmentsCsv(clipProject, document, 10000));
+
+    assert.equal(records[0].csv_schema_version, "amp-clip-segments-v1");
+    assert.equal(records[0].labelling_mode, "auto_clip");
+    assert.deepEqual(
+        records.map((record) => record.segment_type),
+        ["delivery", "delivery", "excluded", "background", "background", "background", "background"],
+    );
+
+    const firstDelivery = records[0];
+    assert.equal(firstDelivery.start_ms, "1000");
+    assert.equal(firstDelivery.end_ms, "2000");
+    assert.equal(firstDelivery.duration_ms, "1000");
+    assert.equal(firstDelivery.event_ms, "1500");
+    assert.equal(firstDelivery.delivery_index, "1");
+    assert.equal(firstDelivery.delivery_outcome, "boundary");
+    // 25 fps: 1000 ms is frame 25, 1500 ms is frame 37 (nearest).
+    assert.equal(firstDelivery.start_frame_0based, "25");
+    assert.equal(firstDelivery.event_frame_0based, "38");
+
+    const excluded = records.find((record) => record.segment_type === "excluded");
+    assert.equal(excluded.exclusion_reason, "replay");
+    assert.equal(excluded.segment_note, "broadcast replay");
+    assert.equal(excluded.delivery_index, "");
+
+    assert.deepEqual(
+        records
+            .filter((record) => record.segment_type === "background")
+            .map((record) => [record.start_ms, record.end_ms]),
+        [["0", "1000"], ["2000", "4000"], ["5000", "7000"], ["8000", "10000"]],
+    );
+    // The tail after the excluded region is background too.
+    assert.equal(records.every((record) => record.coverage_complete === "true"), true);
+});
+
+test("without the coverage assertion the clip CSV ships positives but no negatives", () => {
+    const document = clipDocument();
+    document.review.coverageComplete = false;
+    const records = csvRecords(labels.buildClipSegmentsCsv(clipProject, document, 10000));
+
+    // An unmarked delivery would otherwise be exported as confirmed
+    // non-delivery, so the negatives are withheld rather than guessed.
+    assert.ok(!records.some((record) => record.segment_type === "background"));
+    assert.equal(records.filter((record) => record.segment_type === "delivery").length, 2);
+    assert.equal(records.filter((record) => record.segment_type === "excluded").length, 1);
+    assert.equal(records.every((record) => record.coverage_complete === "false"), true);
+});
+
+test("biomechanics projects are untouched by the mode split", () => {
+    const document = documentForTest();
+    assert.equal(labels.normalizeLabellingMode(document.review.labellingMode), "biomechanics");
+    const records = csvRecords(labels.buildLabelsCsv(project, document, rubric));
+    assert.ok(records.length > 0);
+    assert.equal(records[0].csv_schema_version, "amp-training-labels-long-v2");
+});

@@ -13,21 +13,30 @@ import {
   battingRubricRouting,
   emptyDocument,
   getLabel,
+  CLIP_SEGMENTS_CSV_SCHEMA_VERSION,
   LABELS_CSV_SCHEMA_VERSION,
   MIN_RATING_WEIGHT_PCT,
   labelKey,
   makeLabel,
+  buildClipSegmentsCsv,
   normalizeBowlingTypeFaced,
   normalizeDeliveryBowlingTypeFaced,
   normalizeDeliveryHandedness,
+  backgroundRegions,
+  normalizeExcludedRegions,
   normalizeHandedness,
+  normalizeLabellingMode,
   scoreDocument,
   validateDocument,
   HANDEDNESS_VALUES,
+  EXCLUSION_REASONS,
   type AnnotationDocument,
   type BowlingTypeFaced,
   type Delivery,
+  type ExcludedRegion,
+  type ExclusionReason,
   type Handedness,
+  type LabellingMode,
   type DeliveryLabel,
   type ReviewState,
   type Visibility,
@@ -439,6 +448,7 @@ interface VideoProject {
 }
 
 interface UploadForm {
+  labellingMode: LabellingMode;
   playerRef: string;
   discipline: Discipline;
   sex: AthleteSex;
@@ -451,6 +461,7 @@ interface UploadForm {
 }
 
 const INITIAL_UPLOAD: UploadForm = {
+  labellingMode: "biomechanics",
   playerRef: "",
   discipline: "batting",
   sex: "male",
@@ -476,6 +487,56 @@ const STEPS: { id: WorkflowStep; number: string; label: string }[] = [
   { id: "label", number: "03", label: "Label KPIs" },
   { id: "review", number: "04", label: "Review & export" },
 ];
+
+/**
+ * Auto-clip has no rubric, so the KPI step does not exist in that mode and the
+ * remaining steps renumber rather than leaving a gap at 03.
+ */
+const CLIP_STEPS: { id: WorkflowStep; number: string; label: string }[] = [
+  { id: "setup", number: "01", label: "Capture setup" },
+  { id: "segment", number: "02", label: "Mark deliveries" },
+  { id: "review", number: "03", label: "Review & export" },
+];
+
+function stepsForMode(mode: LabellingMode) {
+  return mode === "auto_clip" ? CLIP_STEPS : STEPS;
+}
+
+const LABELLING_MODE_OPTIONS: {
+  value: LabellingMode;
+  label: string;
+  helper: string;
+}[] = [
+  {
+    value: "biomechanics",
+    label: "Biomechanics",
+    helper: "Mark deliveries, then score the rubric KPIs against them.",
+  },
+  {
+    value: "auto_clip",
+    label: "Auto clipping",
+    helper: "Mark delivery boundaries and excluded regions to train a clipper. No KPI scoring.",
+  },
+];
+
+/**
+ * Typed as a total record over EXCLUSION_REASONS, so adding a reason to the
+ * contract fails the build until it also has a label here -- the dropdown can
+ * never silently omit a reason the exporter accepts.
+ */
+const EXCLUSION_REASON_LABELS: Record<ExclusionReason, string> = {
+  replay: "Replay",
+  slow_motion: "Slow motion",
+  warm_up: "Warm-up / practice",
+  non_match_footage: "Non-match footage",
+  crowd_or_cutaway: "Crowd / cutaway",
+  other: "Other",
+};
+
+const EXCLUSION_REASON_OPTIONS = EXCLUSION_REASONS.map((value) => ({
+  value,
+  label: EXCLUSION_REASON_LABELS[value],
+}));
 
 const DELETE_REPORT_CONFIRMATION = "DELETE";
 
@@ -509,6 +570,8 @@ function hydrateDocument(value: unknown, fps?: number): AnnotationDocument {
   if (!value || typeof value !== "object") return fallback;
   const candidate = value as Partial<AnnotationDocument>;
   const review = { ...fallback.review, ...(candidate.review ?? {}) };
+  review.labellingMode = normalizeLabellingMode(review.labellingMode);
+  review.coverageComplete = review.coverageComplete === true;
   const legacyDefault = legacyBowlingTypeFaced(review.bowlerType);
   const deliveries = Array.isArray(candidate.deliveries)
     ? candidate.deliveries.map((delivery) => {
@@ -539,6 +602,7 @@ function hydrateDocument(value: unknown, fps?: number): AnnotationDocument {
       ...review,
       ...normalizeSubjectFocusMetadata(review),
     },
+    excludedRegions: normalizeExcludedRegions(candidate.excludedRegions),
   };
 }
 
@@ -591,6 +655,9 @@ export function LabelLab({ onExit }: { onExit?: () => void | Promise<void> }) {
     document.deliveries.find((delivery) => delivery.id === selectedDeliveryId) ??
     document.deliveries[0];
   const activeDeliveryId = selectedDelivery?.id ?? "";
+  const labellingMode = normalizeLabellingMode(document.review.labellingMode);
+  const isClipMode = labellingMode === "auto_clip";
+  const excludedRegions = normalizeExcludedRegions(document.excludedRegions);
   const activeBattingMode = bowlingTypeFacedFor(selectedDelivery);
   const rubric = useMemo(
     () => getRubric(
@@ -1042,8 +1109,16 @@ export function LabelLab({ onExit }: { onExit?: () => void | Promise<void> }) {
       await fetchProjects();
       setDirty(false);
       await loadProject(created.video.id);
+      updateDocument((current) => ({
+        ...current,
+        review: { ...current.review, labellingMode: uploadForm.labellingMode },
+      }));
       setStep("segment");
-      setNotice("Video ready. Mark each delivery before labeling.");
+      setNotice(
+        uploadForm.labellingMode === "auto_clip"
+          ? "Video ready. Mark every delivery, then flag any replays or cutaways."
+          : "Video ready. Mark each delivery before labeling.",
+      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Upload failed.");
     } finally {
@@ -1164,6 +1239,42 @@ export function LabelLab({ onExit }: { onExit?: () => void | Promise<void> }) {
       handedness,
       handednessSource: handedness ? "delivery" : undefined,
     });
+  }
+
+  function addExcludedRegion() {
+    if (!project) return;
+    const anchorMs = Math.round(currentMs);
+    const region: ExcludedRegion = {
+      id: crypto.randomUUID(),
+      startMs: Math.max(0, anchorMs - 1500),
+      endMs: Math.min(project.durationMs, anchorMs + 1500),
+      reason: null,
+      note: "",
+    };
+    updateDocument((current) => ({
+      ...current,
+      excludedRegions: [...normalizeExcludedRegions(current.excludedRegions), region].sort(
+        (left, right) => left.startMs - right.startMs,
+      ),
+    }));
+  }
+
+  function updateExcludedRegion(id: string, patch: Partial<ExcludedRegion>) {
+    updateDocument((current) => ({
+      ...current,
+      excludedRegions: normalizeExcludedRegions(current.excludedRegions).map((region) =>
+        region.id === id ? { ...region, ...patch } : region,
+      ),
+    }));
+  }
+
+  function removeExcludedRegion(id: string) {
+    updateDocument((current) => ({
+      ...current,
+      excludedRegions: normalizeExcludedRegions(current.excludedRegions).filter(
+        (region) => region.id !== id,
+      ),
+    }));
   }
 
   function removeDelivery(delivery: Delivery) {
@@ -1374,21 +1485,31 @@ export function LabelLab({ onExit }: { onExit?: () => void | Promise<void> }) {
       setStep("review");
       return;
     }
-    const csv = buildLabelsCsv(project, document, rubric, rubricRouting);
+    const csv = isClipMode
+      ? buildClipSegmentsCsv(project, document, project.durationMs)
+      : buildLabelsCsv(project, document, rubric, rubricRouting);
     const blob = new Blob(["\uFEFF", csv], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const anchor = window.document.createElement("a");
     anchor.href = url;
-    anchor.download = `${sanitizeFilename(project.filename)}-${draft ? "draft-" : ""}training-labels-v2.csv`;
+    anchor.download = `${sanitizeFilename(project.filename)}-${draft ? "draft-" : ""}${
+      isClipMode ? "clip-segments-v1" : "training-labels-v2"
+    }.csv`;
     anchor.click();
     URL.revokeObjectURL(url);
-    setNotice(draft ? "Draft CSV exported with incomplete rows marked." : "Validated CSV exported.");
+    setNotice(
+      draft
+        ? isClipMode
+          ? "Draft CSV exported. Background rows are omitted until coverage is confirmed."
+          : "Draft CSV exported with incomplete rows marked."
+        : "Validated CSV exported.",
+    );
   }
 
   function jumpToIssue(deliveryId?: string, kpiId?: string) {
     if (deliveryId && deliveryId !== "clip") setSelectedDeliveryId(deliveryId);
     if (kpiId) setSelectedKpiId(kpiId);
-    setStep(kpiId ? "label" : deliveryId ? "segment" : "setup");
+    setStep(kpiId && !isClipMode ? "label" : deliveryId ? "segment" : "setup");
   }
 
   const videoWorkspace = (compact = false) => (
@@ -1549,6 +1670,23 @@ export function LabelLab({ onExit }: { onExit?: () => void | Promise<void> }) {
           )}
         </button>
         {selectedFile && <div className="upload-preview">{videoWorkspace(true)}</div>}
+        <fieldset className="mode-picker">
+          <legend>What is this footage for? <em>fixed once created</em></legend>
+          <div className="mode-picker-options">
+            {LABELLING_MODE_OPTIONS.map((option) => (
+              <button
+                type="button"
+                key={option.value}
+                className={uploadForm.labellingMode === option.value ? "active" : ""}
+                aria-pressed={uploadForm.labellingMode === option.value}
+                onClick={() => setUploadForm({ ...uploadForm, labellingMode: option.value })}
+              >
+                <strong>{option.label}</strong>
+                <small>{option.helper}</small>
+              </button>
+            ))}
+          </div>
+        </fieldset>
         <div className="form-grid form-grid--two">
           <label className="field field--wide">
             <span>Player reference <em>pseudonymous</em></span>
@@ -1581,6 +1719,7 @@ export function LabelLab({ onExit }: { onExit?: () => void | Promise<void> }) {
               <option value="behind">Behind</option>
             </select>
           </label>
+          {uploadForm.labellingMode === "biomechanics" && (
           <label className="field">
             <span>Sex benchmark</span>
             <select
@@ -1590,6 +1729,8 @@ export function LabelLab({ onExit }: { onExit?: () => void | Promise<void> }) {
               <option value="male">Male · attached tiered KPI set</option>
             </select>
           </label>
+          )}
+          {uploadForm.labellingMode === "biomechanics" && (
           <label className="field">
             <span>Age band</span>
             <select
@@ -1601,6 +1742,8 @@ export function LabelLab({ onExit }: { onExit?: () => void | Promise<void> }) {
               ))}
             </select>
           </label>
+          )}
+          {uploadForm.labellingMode === "biomechanics" && (
           <label className="field">
             <span>Workbook tier <em>select explicitly</em></span>
             <select
@@ -1612,6 +1755,7 @@ export function LabelLab({ onExit }: { onExit?: () => void | Promise<void> }) {
               ))}
             </select>
           </label>
+          )}
           <label className="field">
             <span>Source frame rate</span>
             <select
@@ -1857,9 +2001,96 @@ export function LabelLab({ onExit }: { onExit?: () => void | Promise<void> }) {
             <label className="field"><span>Outcome / delivery note</span><input value={selectedDelivery.outcome} onChange={(event) => updateDelivery(selectedDelivery.id, { outcome: event.target.value })} placeholder="e.g. boundary, beaten, miscued" /></label>
           </div>
         ) : null}
+        {isClipMode && (
+          <div className="clip-extras">
+            <div className="clip-extras-heading">
+              <h3>Excluded regions</h3>
+              <button type="button" onClick={addExcludedRegion}>+ Add at playhead</button>
+            </div>
+            <p className="clip-extras-copy">
+              Flag replays, slow motion and cutaways. They look like deliveries, so
+              leaving them in the background would train the clipper against itself.
+            </p>
+            {excludedRegions.length === 0 ? (
+              <p className="clip-extras-empty">No excluded regions.</p>
+            ) : (
+              <ul className="excluded-region-list">
+                {excludedRegions.map((region) => (
+                  <li key={region.id}>
+                    <div className="excluded-region-times">
+                      <button type="button" onClick={() => seek(region.startMs)}>
+                        {formatTime(region.startMs)} → {formatTime(region.endMs)}
+                      </button>
+                      <span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            updateExcludedRegion(region.id, { startMs: Math.round(currentMs) })
+                          }
+                        >
+                          Set start
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            updateExcludedRegion(region.id, { endMs: Math.round(currentMs) })
+                          }
+                        >
+                          Set end
+                        </button>
+                      </span>
+                    </div>
+                    <select
+                      value={region.reason ?? ""}
+                      onChange={(event) =>
+                        updateExcludedRegion(region.id, {
+                          reason: (event.target.value || null) as ExclusionReason | null,
+                        })
+                      }
+                    >
+                      <option value="">Choose a reason</option>
+                      {EXCLUSION_REASON_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </select>
+                    <input
+                      value={region.note}
+                      placeholder="Note (optional)"
+                      onChange={(event) =>
+                        updateExcludedRegion(region.id, { note: event.target.value })
+                      }
+                    />
+                    <button
+                      type="button"
+                      className="excluded-region-remove"
+                      onClick={() => removeExcludedRegion(region.id)}
+                    >
+                      Remove
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <label className="coverage-row">
+              <input
+                type="checkbox"
+                checked={document.review.coverageComplete}
+                onChange={(event) => updateReview("coverageComplete", event.target.checked)}
+              />
+              <span>
+                Every delivery in this video is marked. Confirming this is what lets the
+                export ship background rows as confirmed non-delivery.
+              </span>
+            </label>
+          </div>
+        )}
         <div className="panel-footer">
           <button className="secondary-button" type="button" onClick={() => void saveProject()} disabled={isSaving}>{isSaving ? "Saving…" : "Save segments"}</button>
-          <button className="primary-button" type="button" onClick={() => setStep("label")} disabled={!document.deliveries.length}>Start labeling →</button>
+          {isClipMode ? (
+            <button className="primary-button" type="button" onClick={() => setStep("review")} disabled={!document.deliveries.length}>Review &amp; export →</button>
+          ) : (
+            <button className="primary-button" type="button" onClick={() => setStep("label")} disabled={!document.deliveries.length}>Start labeling →</button>
+          )}
         </div>
       </aside>
     </section>
@@ -2145,12 +2376,21 @@ export function LabelLab({ onExit }: { onExit?: () => void | Promise<void> }) {
           <div><span className="eyebrow">Quality control</span><h2>Review the data, not just the rating.</h2></div>
           <span className={`review-badge ${blockers.length ? "review-badge--blocked" : "review-badge--ready"}`}>{blockers.length ? `${blockers.length} blockers` : "Ready to finalise"}</span>
         </div>
+        {isClipMode ? (
+        <div className="metric-grid">
+          <div className="metric-card metric-card--hero"><span>Marked deliveries</span><strong>{document.deliveries.length}</strong><small>positive examples for the clipper</small></div>
+          <div className="metric-card"><span>Excluded regions</span><strong>{excludedRegions.length}</strong><small>replays, slow motion and cutaways</small></div>
+          <div className="metric-card"><span>Background rows</span><strong>{document.review.coverageComplete ? backgroundRegions(project.durationMs, document.deliveries, excludedRegions).length : "—"}</strong><small>{document.review.coverageComplete ? "derived confirmed non-delivery" : "needs the coverage confirmation"}</small></div>
+          <div className="metric-card"><span>Labelled span</span><strong>{Math.round((document.deliveries.reduce((total, delivery) => total + Math.max(0, delivery.endMs - delivery.startMs), 0) / Math.max(1, project.durationMs)) * 100)}%</strong><small>of the video inside a delivery</small></div>
+        </div>
+        ) : (
         <div className="metric-grid">
           <div className="metric-card metric-card--hero"><span>Derived technique score</span><strong>{score.activeWeight >= MIN_RATING_WEIGHT_PCT && score.score10 !== null ? score.score10.toFixed(2) : "Suppressed"}</strong><small>{score.activeWeight >= MIN_RATING_WEIGHT_PCT ? "out of 10 · deterministic weighted mean" : "low-confidence coverage below workbook threshold"}</small></div>
           <div className="metric-card"><span>Label coverage</span><strong>{score.coveragePct.toFixed(0)}%</strong><small>{score.visibleCells} of {score.expectedCells} cells assessed</small></div>
           <div className="metric-card"><span>Observable weight</span><strong>{score.activeWeight}%</strong><small>after visibility decisions</small></div>
           <div className="metric-card"><span>Deliveries</span><strong>{document.deliveries.length}</strong><small>clip KPIs score across the same-mode deliveries</small></div>
         </div>
+        )}
         <div className="qa-card">
           <div className="qa-heading"><div><span className="section-number">Dataset gates</span><h3>{issues.length ? "Items that need attention" : "All checks passed"}</h3></div><div className="qa-counts"><span>{blockers.length} blockers</span><span>{warnings.length} warnings</span></div></div>
           <div className="issue-list">
@@ -2166,15 +2406,31 @@ export function LabelLab({ onExit }: { onExit?: () => void | Promise<void> }) {
       </div>
       <aside className="export-panel">
         <span className="section-number">Export contract</span>
-        <h3>Long-form CSV</h3>
-        <p>One row per delivery × KPI, with millisecond and zero-based frame timing, explicit null states, human/model separation, and source workbook provenance. Clip-level KPIs export once.</p>
-        <ul>
-          <li><span>Schema</span><strong>{LABELS_CSV_SCHEMA_VERSION}</strong></li>
-          <li><span>Rubric</span><strong>{rubric.id}</strong></li>
-          <li><span>Route</span><strong>{rubric.routeKey ?? "legacy"}</strong></li>
-          <li><span>Split key</span><strong>player + capture session</strong></li>
-          <li><span>Ground truth</span><strong>human labels only</strong></li>
-        </ul>
+        {isClipMode ? (
+          <>
+            <h3>Clip segments CSV</h3>
+            <p>One row per labelled span, typed as delivery, excluded or background. Background rows are the confirmed non-delivery stretches and are only derived once you confirm every delivery is marked.</p>
+            <ul>
+              <li><span>Schema</span><strong>{CLIP_SEGMENTS_CSV_SCHEMA_VERSION}</strong></li>
+              <li><span>Row grain</span><strong>one per segment</strong></li>
+              <li><span>Negatives</span><strong>{document.review.coverageComplete ? "derived background" : "not exported"}</strong></li>
+              <li><span>Split key</span><strong>player + capture session</strong></li>
+              <li><span>Ground truth</span><strong>human boundaries only</strong></li>
+            </ul>
+          </>
+        ) : (
+          <>
+            <h3>Long-form CSV</h3>
+            <p>One row per delivery × KPI, with millisecond and zero-based frame timing, explicit null states, human/model separation, and source workbook provenance. Clip-level KPIs export once.</p>
+            <ul>
+              <li><span>Schema</span><strong>{LABELS_CSV_SCHEMA_VERSION}</strong></li>
+              <li><span>Rubric</span><strong>{rubric.id}</strong></li>
+              <li><span>Route</span><strong>{rubric.routeKey ?? "legacy"}</strong></li>
+              <li><span>Split key</span><strong>player + capture session</strong></li>
+              <li><span>Ground truth</span><strong>human labels only</strong></li>
+            </ul>
+          </>
+        )}
         <label className="field"><span>Reviewer <em>recommended</em></span><input value={document.review.reviewer} onChange={(event) => updateReview("reviewer", event.target.value)} placeholder="Second expert ID" /></label>
         <div className="export-actions">
           <button className="secondary-button secondary-button--full" type="button" onClick={() => exportCsv(true)}>Export draft CSV</button>
@@ -2247,11 +2503,15 @@ export function LabelLab({ onExit }: { onExit?: () => void | Promise<void> }) {
             <div className="workflow-bar">
               <div className="project-identity"><span className="video-type">{project.discipline.slice(0, 2).toUpperCase()}</span><span><strong>{project.playerRef}</strong><small>{project.filename} · {formatBytes(project.sizeBytes)}</small></span></div>
               <nav aria-label="Labeling workflow">
-                {STEPS.map((item) => (
+                {stepsForMode(labellingMode).map((item) => (
                   <button type="button" key={item.id} className={step === item.id ? "active" : ""} onClick={() => setStep(item.id)}><small>{item.number}</small><span>{item.label}</span></button>
                 ))}
               </nav>
-              <div className="project-score"><small>Score</small><strong>{score.activeWeight >= MIN_RATING_WEIGHT_PCT && score.score10 !== null ? score.score10.toFixed(1) : "—"}</strong></div>
+              {isClipMode ? (
+                <div className="project-score"><small>Deliveries</small><strong>{document.deliveries.length}</strong></div>
+              ) : (
+                <div className="project-score"><small>Score</small><strong>{score.activeWeight >= MIN_RATING_WEIGHT_PCT && score.score10 !== null ? score.score10.toFixed(1) : "—"}</strong></div>
+              )}
             </div>
           )}
           {(error || notice) && (

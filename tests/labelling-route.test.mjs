@@ -161,3 +161,41 @@ test("batting routing is selected per delivery and pending deletions are retry-o
     assert.match(styles, /\.amp-labelling \.handedness-field\s*\{/);
     assert.match(styles, /\.amp-labelling \.project-card--deleting\s*\{/);
 });
+
+test("the labelling mode is chosen at upload and reshapes the workflow", async () => {
+    const [component, styles] = await Promise.all([
+        read("../src/app/labelling/LabelLab.tsx"),
+        read("../src/app/labelling/labelling.css"),
+    ]);
+
+    assert.match(component, /LABELLING_MODE_OPTIONS/);
+    assert.match(component, /Auto clipping/);
+    assert.match(component, /const isClipMode = labellingMode === "auto_clip"/);
+    // Auto clipping has no rubric, so the KPI step must not appear in its nav.
+    assert.match(component, /const CLIP_STEPS/);
+    assert.match(component, /stepsForMode\(labellingMode\)/);
+    assert.doesNotMatch(
+        component,
+        /const CLIP_STEPS[\s\S]*?id: "label"[\s\S]*?\];/,
+    );
+    // The mode is stored inside the annotation JSON, which the API persists
+    // opaquely, so no server-side change is needed to record it.
+    assert.match(component, /review: \{ \.\.\.current\.review, labellingMode: uploadForm\.labellingMode \}/);
+    assert.match(component, /buildClipSegmentsCsv\(project, document, project\.durationMs\)/);
+    assert.match(styles, /\.amp-labelling \.mode-picker\s*\{/);
+});
+
+test("auto clipping collects excluded regions and an explicit coverage assertion", async () => {
+    const [component, styles] = await Promise.all([
+        read("../src/app/labelling/LabelLab.tsx"),
+        read("../src/app/labelling/labelling.css"),
+    ]);
+
+    assert.match(component, /EXCLUSION_REASON_OPTIONS/);
+    assert.match(component, /function addExcludedRegion/);
+    assert.match(component, /function removeExcludedRegion/);
+    assert.match(component, /updateReview\("coverageComplete", event\.target\.checked\)/);
+    assert.match(component, /Every delivery in this video is marked/);
+    assert.match(styles, /\.amp-labelling \.excluded-region-list\s*\{/);
+    assert.match(styles, /\.amp-labelling \.coverage-row\s*\{/);
+});

@@ -1,6 +1,12 @@
 # AMP training labels CSV v2
 
-`amp-training-labels-long-v2` is the handoff contract produced by AMP Label Lab.
+`amp-training-labels-long-v2` is the handoff contract produced by AMP Label Lab
+when a project is labelled in **biomechanics** mode.
+
+Projects labelled in **auto clipping** mode produce a different, much smaller
+contract instead: see [AMP clip segments CSV v1](#amp-clip-segments-csv-v1) at
+the end of this document. The mode is chosen once, at upload, and is recorded on
+every row of both exports as `labelling_mode`.
 
 ## Row grain
 
@@ -123,3 +129,70 @@ The catalog has nine male routes and 131 unique KPI IDs. Foundation uses explici
 ## File format
 
 The browser download is UTF-8 with a BOM for spreadsheet compatibility. Records use RFC-4180 quoting and CRLF row endings; embedded commas, quotes, and line breaks are escaped. Column order is version-locked in `LABELS_CSV_COLUMNS` for v2. The shot-footwork/multi-evidence, subject-focus/shot-type, bowling-faced routing, and per-delivery handedness fields were appended after the original v2 columns, so every pre-existing column retains its name and ordinal position.
+
+
+---
+
+# AMP clip segments CSV v1
+
+`amp-clip-segments-v1` is produced by projects labelled in **auto clipping**
+mode. It trains a model to find deliveries in an unsegmented video, so it
+carries boundaries and nothing from the KPI rubric — no scores, footwork, shot
+type, bowling type faced, handedness, tier or route.
+
+## Row grain
+
+One row per labelled span of video, typed by `segment_type`:
+
+- `delivery` — a human-marked delivery: the positive examples;
+- `excluded` — a span that is neither delivery nor usable background; and
+- `background` — the derived remainder: the confirmed non-delivery stretches.
+
+`record_id` is `video_id::segment_type::segment_index`. Rows are emitted
+deliveries first, then exclusions, then background.
+
+## Coverage is what makes the negatives real
+
+`background` rows exist **only** when the annotator has confirmed that every
+delivery in the video is marked, recorded on every row as `coverage_complete`.
+
+This is the point of the mode. A detection model learns mostly from confirmed
+negatives, but an unmarked delivery sitting inside a "background" span teaches
+the model that a real delivery is a non-delivery — worse than having no
+negatives at all. So without the assertion the export ships positives and
+exclusions only, and `coverage_complete=false` says so explicitly. Review
+blocks on the assertion before a final export.
+
+## Exclusions
+
+`exclusion_reason` is one of `replay`, `slow_motion`, `warm_up`,
+`non_match_footage`, `crowd_or_cutaway`, or `other`, and is required on every
+excluded region. Broadcast replays and slow motion matter most: they look
+exactly like deliveries, so leaving them in the background would train the
+clipper against itself.
+
+An unrecognised reason normalizes to empty rather than being carried through, so
+no invented category reaches training data.
+
+## Geometry rules
+
+Deliveries may not overlap each other, and an excluded region may not overlap a
+delivery — both are review blockers. A detection model needs one unambiguous
+label per frame, and overlapping spans leave the target for the shared frames
+undefined.
+
+All `_ms` fields are integer milliseconds from the start of the video, and
+`_frame_0based` fields are zero-based indices from `video_fps` by nearest-frame
+rounding. `event_ms` carries the delivery's contact or release anchor and is
+blank on excluded and background rows.
+
+## Splits
+
+`dataset_group_key` is `player_ref::capture_session_id`, as in v2. Keep every
+row for one player and capture session in the same split — background rows from
+a video whose deliveries are in the training set must not land in test.
+
+## File format
+
+UTF-8 with a BOM, RFC-4180 quoting, CRLF row endings. Column order is
+version-locked in `CLIP_SEGMENTS_CSV_COLUMNS`.

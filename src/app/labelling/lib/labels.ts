@@ -20,12 +20,23 @@ import {
   isFootworkRestrictedKpi,
   isSubjectFocusComplete,
   normalizeDeliveryShotMetadata,
+  normalizeExcludedRegion,
+  normalizeExcludedRegions,
+  normalizeExclusionReason,
+  normalizeLabellingMode,
   normalizeShotType,
   normalizeSubjectFocusMetadata,
   normalizeSubjectFocusRole,
+  backgroundRegions,
+  rangesOverlap,
+  EXCLUSION_REASONS,
+  LABELLING_MODES,
   SHOT_TYPE_VALUES,
   SUBJECT_FOCUS_ROLE_VALUES,
   type DeliveryShotMetadata,
+  type ExcludedRegion,
+  type ExclusionReason,
+  type LabellingMode,
   type FootworkApplicabilityState,
   type ShotType,
   type ShotFootwork,
@@ -43,14 +54,25 @@ export {
   isFootworkRestrictedKpi,
   isSubjectFocusComplete,
   normalizeDeliveryShotMetadata,
+  normalizeExcludedRegion,
+  normalizeExcludedRegions,
+  normalizeExclusionReason,
+  normalizeLabellingMode,
   normalizeShotType,
   normalizeSubjectFocusMetadata,
   normalizeSubjectFocusRole,
+  backgroundRegions,
+  rangesOverlap,
+  EXCLUSION_REASONS,
+  LABELLING_MODES,
   SHOT_TYPE_VALUES,
   SUBJECT_FOCUS_ROLE_VALUES,
 };
 export type {
   DeliveryShotMetadata,
+  ExcludedRegion,
+  ExclusionReason,
+  LabellingMode,
   FootworkApplicabilityState,
   ShotFootwork,
   ShotType,
@@ -125,6 +147,13 @@ export interface ReviewState {
   multiplePeopleVisible: boolean;
   subjectFocusRole: SubjectFocusRole | null;
   subjectFocusDescription: string;
+  labellingMode: LabellingMode;
+  /**
+   * Auto-clip only. The annotator asserting that every delivery in the video
+   * is marked. Nothing derives background negatives without it, because an
+   * unmarked delivery would otherwise be exported as confirmed non-delivery.
+   */
+  coverageComplete: boolean;
 }
 
 export interface AnnotationDocument {
@@ -132,6 +161,8 @@ export interface AnnotationDocument {
   deliveries: Delivery[];
   labels: DeliveryLabel[];
   review: ReviewState;
+  /** Auto-clip only; empty for biomechanics projects. */
+  excludedRegions?: ExcludedRegion[];
 }
 
 export interface QualityIssue {
@@ -166,6 +197,8 @@ export const EMPTY_REVIEW: ReviewState = {
   multiplePeopleVisible: false,
   subjectFocusRole: null,
   subjectFocusDescription: "",
+  labellingMode: "biomechanics",
+  coverageComplete: false,
 };
 
 export const MIN_RATING_WEIGHT_PCT = 50;
@@ -176,6 +209,7 @@ export function emptyDocument(): AnnotationDocument {
     deliveries: [],
     labels: [],
     review: { ...EMPTY_REVIEW },
+    excludedRegions: [],
   };
 }
 
@@ -745,6 +779,119 @@ function validateSingleRubric(
   return issues;
 }
 
+/**
+ * Auto-clip validation. A clipping dataset is judged on its segment geometry
+ * and on whether its negatives can be trusted, so this checks boundaries,
+ * overlaps and the coverage assertion -- and deliberately shares none of the
+ * rubric, footwork or KPI checks, which mean nothing in this mode.
+ */
+function validateClipDocument(
+  document: AnnotationDocument,
+  durationMs: number,
+): QualityIssue[] {
+  const issues: QualityIssue[] = [];
+  if (!document.review.annotator.trim()) {
+    issues.push({
+      id: "annotator-required",
+      severity: "blocker",
+      message: "Add the annotator name before review.",
+    });
+  }
+  if (!document.review.captureSession.trim()) {
+    issues.push({
+      id: "session-required",
+      severity: "blocker",
+      message: "Add a capture-session ID so dataset splits stay player/session safe.",
+    });
+  }
+  if (document.deliveries.length === 0) {
+    issues.push({
+      id: "delivery-required",
+      severity: "blocker",
+      message: "Mark at least one delivery.",
+    });
+  }
+
+  const deliveries = [...document.deliveries].sort(
+    (left, right) => left.startMs - right.startMs,
+  );
+  for (const delivery of deliveries) {
+    if (
+      delivery.startMs < 0 ||
+      delivery.startMs >= delivery.endMs ||
+      delivery.endMs > durationMs + 50
+    ) {
+      issues.push({
+        id: `clip-bounds-${delivery.id}`,
+        severity: "blocker",
+        message: `Delivery ${delivery.index} has start and end times outside the video.`,
+        deliveryId: delivery.id,
+      });
+    }
+  }
+
+  // Overlapping deliveries are a blocker here, not a warning: a detection
+  // model needs one unambiguous label per frame, and overlapping spans make
+  // the target for the shared frames undefined.
+  for (let index = 1; index < deliveries.length; index += 1) {
+    const previous = deliveries[index - 1];
+    const current = deliveries[index];
+    if (rangesOverlap(previous.startMs, previous.endMs, current.startMs, current.endMs)) {
+      issues.push({
+        id: `clip-overlap-${previous.id}-${current.id}`,
+        severity: "blocker",
+        message: `Deliveries ${previous.index} and ${current.index} overlap; a clip boundary cannot cover both.`,
+        deliveryId: current.id,
+      });
+    }
+  }
+
+  const excluded = normalizeExcludedRegions(document.excludedRegions);
+  for (const region of excluded) {
+    if (
+      region.startMs < 0 ||
+      region.startMs >= region.endMs ||
+      region.endMs > durationMs + 50
+    ) {
+      issues.push({
+        id: `excluded-bounds-${region.id}`,
+        severity: "blocker",
+        message: "An excluded region has start and end times outside the video.",
+      });
+    }
+    if (!region.reason) {
+      issues.push({
+        id: `excluded-reason-${region.id}`,
+        severity: "blocker",
+        message: "Choose why each region is excluded, so the reason is explicit in training data.",
+      });
+    }
+    for (const delivery of deliveries) {
+      if (rangesOverlap(region.startMs, region.endMs, delivery.startMs, delivery.endMs)) {
+        issues.push({
+          id: `excluded-overlap-${region.id}-${delivery.id}`,
+          severity: "blocker",
+          message: `An excluded region overlaps delivery ${delivery.index}; a span cannot be both.`,
+          deliveryId: delivery.id,
+        });
+      }
+    }
+  }
+
+  // Without the assertion the export still ships the marked deliveries, but it
+  // cannot ship background rows, which is most of the training signal.
+  if (!document.review.coverageComplete) {
+    issues.push({
+      id: "coverage-not-asserted",
+      severity: "blocker",
+      message:
+        "Confirm every delivery in this video is marked. Until then the export carries no background rows.",
+    });
+  }
+
+  return [...new Map(issues.map((issue) => [issue.id, issue])).values()];
+}
+
 export function validateDocument(
   document: AnnotationDocument,
   rubric: Rubric,
@@ -753,6 +900,9 @@ export function validateDocument(
   fps?: number,
   disciplineOrRouting?: Discipline | LabelRubricRouting,
 ): QualityIssue[] {
+  if (normalizeLabellingMode(document.review.labellingMode) === "auto_clip") {
+    return validateClipDocument(document, durationMs);
+  }
   const routing = typeof disciplineOrRouting === "object" ? disciplineOrRouting : undefined;
   const discipline = typeof disciplineOrRouting === "string"
     ? disciplineOrRouting
@@ -1342,6 +1492,156 @@ export function buildLabelsCsv(
     ...rows.map((row) => LABELS_CSV_COLUMNS.map((column) => csvCell(row[column])).join(",")),
   ]
     .join("\r\n");
+}
+
+export const CLIP_SEGMENTS_CSV_SCHEMA_VERSION = "amp-clip-segments-v1";
+
+/**
+ * Auto-clip export. One row per labelled span of video, typed by `segment_type`:
+ *
+ * - `delivery`   -- a human-marked delivery, the positive examples;
+ * - `excluded`   -- a span that is neither delivery nor usable background
+ *                   (replay, slow motion, warm-up, cutaway); and
+ * - `background` -- the derived remainder, the confirmed negatives.
+ *
+ * Background rows exist only when the annotator asserted complete coverage.
+ * Without that assertion an unmarked delivery would be exported as confirmed
+ * non-delivery, which is worse than having no negatives at all, so the export
+ * ships positives only and says so in `coverage_complete`.
+ */
+export const CLIP_SEGMENTS_CSV_COLUMNS = [
+  "csv_schema_version",
+  "annotation_schema_version",
+  "labelling_mode",
+  "record_id",
+  "video_id",
+  "video_sha256",
+  "filename",
+  "video_duration_ms",
+  "video_fps",
+  "capture_session_id",
+  "dataset_group_key",
+  "player_ref",
+  "discipline",
+  "camera_angle",
+  "coverage_complete",
+  "segment_type",
+  "segment_index",
+  "delivery_index",
+  "start_ms",
+  "end_ms",
+  "duration_ms",
+  "start_frame_0based",
+  "end_frame_0based",
+  "event_ms",
+  "event_frame_0based",
+  "exclusion_reason",
+  "segment_note",
+  "delivery_outcome",
+  "annotator",
+  "reviewer",
+  "reviewed_at",
+  "project_status",
+  "project_created_at",
+] as const;
+
+type ClipSegmentsCsvColumn = (typeof CLIP_SEGMENTS_CSV_COLUMNS)[number];
+type ClipSegmentsCsvRow = Record<ClipSegmentsCsvColumn, LabelsCsvValue>;
+
+export function buildClipSegmentsCsv(
+  project: CsvProject,
+  document: AnnotationDocument,
+  durationMs: number,
+) {
+  const datasetGroupKey = [project.playerRef, document.review.captureSession]
+    .filter(Boolean)
+    .join("::");
+  const coverageComplete = document.review.coverageComplete === true;
+  const deliveries = [...document.deliveries].sort(
+    (left, right) => left.startMs - right.startMs || left.id.localeCompare(right.id),
+  );
+  const excluded = normalizeExcludedRegions(document.excludedRegions);
+  const background = coverageComplete
+    ? backgroundRegions(durationMs, deliveries, excluded)
+    : [];
+
+  const base = {
+    csv_schema_version: CLIP_SEGMENTS_CSV_SCHEMA_VERSION,
+    annotation_schema_version: document.schemaVersion,
+    labelling_mode: "auto_clip",
+    video_id: project.id,
+    video_sha256: project.sha256,
+    filename: project.filename,
+    video_duration_ms: Math.round(durationMs),
+    video_fps: project.fps,
+    capture_session_id: document.review.captureSession,
+    dataset_group_key: datasetGroupKey,
+    player_ref: project.playerRef,
+    discipline: project.discipline,
+    camera_angle: project.cameraAngle,
+    coverage_complete: coverageComplete,
+    annotator: document.review.annotator,
+    reviewer: document.review.reviewer,
+    reviewed_at: document.review.reviewedAt,
+    project_status: project.status,
+    project_created_at: project.createdAt,
+  };
+
+  const rows: ClipSegmentsCsvRow[] = [];
+  let segmentIndex = 0;
+
+  const push = (
+    segmentType: "delivery" | "excluded" | "background",
+    startMs: number,
+    endMs: number,
+    extra: Partial<ClipSegmentsCsvRow>,
+  ) => {
+    segmentIndex += 1;
+    rows.push({
+      ...base,
+      record_id: `${project.id}::${segmentType}::${segmentIndex}`,
+      segment_type: segmentType,
+      segment_index: segmentIndex,
+      delivery_index: "",
+      start_ms: Math.round(startMs),
+      end_ms: Math.round(endMs),
+      duration_ms: Math.round(endMs - startMs),
+      start_frame_0based: frameIndex(Math.round(startMs), project.fps),
+      end_frame_0based: frameIndex(Math.round(endMs), project.fps),
+      event_ms: "",
+      event_frame_0based: "",
+      exclusion_reason: "",
+      segment_note: "",
+      delivery_outcome: "",
+      ...extra,
+    } as ClipSegmentsCsvRow);
+  };
+
+  for (const delivery of deliveries) {
+    push("delivery", delivery.startMs, delivery.endMs, {
+      delivery_index: delivery.index,
+      event_ms: Math.round(delivery.eventMs),
+      event_frame_0based: frameIndex(Math.round(delivery.eventMs), project.fps),
+      segment_note: delivery.note,
+      delivery_outcome: delivery.outcome,
+    });
+  }
+  for (const region of excluded) {
+    push("excluded", region.startMs, region.endMs, {
+      exclusion_reason: region.reason ?? "",
+      segment_note: region.note,
+    });
+  }
+  for (const gap of background) {
+    push("background", gap.startMs, gap.endMs, {});
+  }
+
+  return [
+    CLIP_SEGMENTS_CSV_COLUMNS.map((column) => csvCell(column)).join(","),
+    ...rows.map((row) =>
+      CLIP_SEGMENTS_CSV_COLUMNS.map((column) => csvCell(row[column])).join(","),
+    ),
+  ].join("\r\n");
 }
 
 export function makeLabel(
